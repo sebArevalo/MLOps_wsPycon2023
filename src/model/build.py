@@ -1,60 +1,57 @@
-import torch
-
-# Import the model class from the main file
-from src.Classifier import Classifier
-
+# build.py
 import os
 import argparse
+import torch
 import wandb
 
+from src import get_model  # <- registry factory
+
 parser = argparse.ArgumentParser()
-parser.add_argument('--IdExecution', type=str, help='ID of the execution')
+parser.add_argument('--IdExecution', type=str, default="testing console")
+parser.add_argument('--model', type=str, default='pairhead_mlp_bn',
+                    help='Model name registered in src (__init__.py): '
+                         'linear, pairhead_mlp_bn, pairhead_mlp_res')
+# Common config knobs (pair-head defaults for LFW embeddings)
+parser.add_argument('--input_shape', type=int, default=1026)   # 512+512+2
+parser.add_argument('--hidden_layer_1', type=int, default=256)
+parser.add_argument('--hidden_layer_2', type=int, default=128)
+parser.add_argument('--num_classes', type=int, default=1)      # binary logit
 args = parser.parse_args()
 
-if args.IdExecution:
-    print(f"IdExecution: {args.IdExecution}")
-else:
-    args.IdExecution = "testing console"
+print(f"IdExecution: {args.IdExecution}")
+os.makedirs("./model", exist_ok=True)
 
-# Check if the directory "./model" exists
-if not os.path.exists("./model"):
-    # If it doesn't exist, create it
-    os.makedirs("./model")
-
-# Data parameters testing
-num_classes = 10
-input_shape = 784
-
-def build_model_and_log(config, model, model_name="MLP", model_description="Simple MLP"):
-    with wandb.init(project="MLOps-Pycon2023", 
-        name=f"initialize Model ExecId-{args.IdExecution}", 
-        job_type="initialize-model", config=config) as run:
-        config = wandb.config
-
-        model_artifact = wandb.Artifact(
+def build_model_and_log(config: dict, model: torch.nn.Module,
+                        model_name: str, model_description: str):
+    with wandb.init(
+        project="MLOps-Pycon2023",
+        name=f"initialize {model_name} ExecId-{args.IdExecution}",
+        job_type="initialize-model",
+        config=config
+    ) as run:
+        art = wandb.Artifact(
             model_name, type="model",
             description=model_description,
-            metadata=dict(config))
+            metadata=dict(config)
+        )
+        fname = f"initialized_model_{model_name}.pth"
+        path = os.path.join("./model", fname)
+        torch.save(model.state_dict(), path)
+        art.add_file(path)
+        run.log_artifact(art)
 
-        name_artifact_model = f"initialized_model_{model_name}.pth"
+# ---- Build the selected model from the registry
+model_config = {
+    "input_shape": args.input_shape,
+    "hidden_layer_1": args.hidden_layer_1,
+    "hidden_layer_2": args.hidden_layer_2,
+    "num_classes": args.num_classes,
+}
+model = get_model(args.model, **model_config)
 
-        torch.save(model.state_dict(), f"./model/{name_artifact_model}")
-        # ➕ another way to add a file to an Artifact
-        model_artifact.add_file(f"./model/{name_artifact_model}")
-
-        wandb.save(name_artifact_model)
-
-        run.log_artifact(model_artifact)
-
-
-# MLP
-# Testing config
-model_config = {"input_shape":input_shape,
-                "hidden_layer_1": 32,
-                "hidden_layer_2": 64,
-                "num_classes":num_classes}
-
-model = Classifier(**model_config)
-
-build_model_and_log(model_config, model, "linear","Simple Linear Classifier")
-###hola
+build_model_and_log(
+    model_config,
+    model,
+    model_name=args.model,
+    model_description=f"{args.model} initialized for LFW pair verification"
+)
