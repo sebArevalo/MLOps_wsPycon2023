@@ -8,7 +8,7 @@ import wandb
 from sklearn.datasets import fetch_lfw_pairs
 
 # --------------------
-# Args
+# Argss
 # --------------------
 parser = argparse.ArgumentParser()
 parser.add_argument("--IdExecution", type=str, default="console")
