@@ -57,3 +57,4 @@ model_config = {"input_shape":input_shape,
 model = Classifier(**model_config)
 
 build_model_and_log(model_config, model, "linear","Simple Linear Classifier")
+###hola
