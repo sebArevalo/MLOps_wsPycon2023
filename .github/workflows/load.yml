@@ -1,0 +1,26 @@
+name: Load raw dataset to W&B
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'src/data/load.py'
+      - 'requirements.txt'
+
+jobs:
+  load_raw:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Run load.py (W&B off)
+        env:
+          WANDB_MODE: disabled
+        run: python src/data/load.py --IdExecution ${{ github.run_number }}
