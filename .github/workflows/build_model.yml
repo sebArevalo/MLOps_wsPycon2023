@@ -2,29 +2,33 @@ name: Build Model like artifact to wandb
 
 on:
   push:
-    branches:
-      - main
+    branches: [ main ]
     paths:
       - 'src/model/build.py'
+      - 'src/model/src/**'
+      - 'requirements.txt'
 
 jobs:
   build_model:
     runs-on: ubuntu-latest
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v3
-    - name: Set up Python
-      uses: actions/setup-python@v4
-      id: setup
-      with:
-        python-version: '3.9'
-        cache: 'pip'
-    - name: Install dependencies
-      #if: steps.setup.outputs.cache-hit != 'true'  
-      run: |
-        python -m pip install --upgrade pip
-        pip install -r requirements.txt
-    - name: Login to WandB
-      run: wandb login ${{ secrets.WANDB_API_KEY }}
-    - name: Run build.py
-      run: python src/model/build.py --IdExecution ${{ github.run_number }}
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          pip install -r requirements.txt
+
+      - name: Login to W&B
+        if: ${{ secrets.WANDB_API_KEY != '' }}
+        run: wandb login ${{ secrets.WANDB_API_KEY }}
+
+      - name: Run build.py (as a module)
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: python -m src.model.build --IdExecution ${{ github.run_number }}
