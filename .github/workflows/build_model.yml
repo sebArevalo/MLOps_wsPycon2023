@@ -7,6 +7,8 @@ on:
       - 'src/model/build.py'
       - 'src/model/src/**'
       - 'requirements.txt'
+      - 'src/__init__.py'
+      - 'src/model/__init__.py'
 
 jobs:
   build_model:
@@ -24,9 +26,15 @@ jobs:
           python -m pip install --upgrade pip setuptools wheel
           pip install -r requirements.txt
 
-      - name: Login to W&B
-        if: ${{ secrets.WANDB_API_KEY != '' }}
-        run: wandb login ${{ secrets.WANDB_API_KEY }}
+      - name: Login to W&B (if key present)
+        env:
+          WANDB_API_KEY: ${{ secrets.WANDB_API_KEY }}
+        run: |
+          if [ -n "$WANDB_API_KEY" ]; then
+            wandb login "$WANDB_API_KEY"
+          else
+            echo "No WANDB_API_KEY secret set; skipping W&B login."
+          fi
 
       - name: Run build.py (as a module)
         env:

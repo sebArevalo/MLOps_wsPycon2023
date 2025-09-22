@@ -6,22 +6,41 @@ on:
     paths:
       - 'src/data/preprocess.py'
       - 'requirements.txt'
+      - 'src/__init__.py'          # optional: retrigger if package markers change
+      - 'src/model/__init__.py'    # optional
 
 jobs:
   preprocess:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
           cache: 'pip'
+
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip setuptools wheel
           pip install -r requirements.txt
+
+      # ✅ enable WANDB for artifact download
+      - name: Login to W&B (if key present)
+        env:
+          WANDB_API_KEY: ${{ secrets.WANDB_API_KEY }}
+        run: |
+          if [ -n "$WANDB_API_KEY" ]; then
+            wandb login "$WANDB_API_KEY"
+          else
+            echo "No WANDB_API_KEY secret set; skipping W&B login. Preprocess will fail if it needs artifacts."
+          fi
+
       - name: Run preprocess.py
         env:
           PYTHONPATH: ${{ github.workspace }}
-          WANDB_MODE: disabled
-        run: python -m src.data.preprocess --IdExecution ${{ github.run_number }}
+        run: |
+          python -m src.data.preprocess \
+            --IdExecution ${{ github.run_number }} \
+            --input_artifact lfw-pairs-raw:latest \
+            --output_artifact lfw-pairs-embeddings
