@@ -5,10 +5,18 @@ import numpy as np
 import torch
 from torch.utils.data import TensorDataset
 import wandb
-from sklearn.datasets import fetch_lfw_pairs
+
+# Helpful import guard so CI/local errors are clearer
+try:
+    from sklearn.datasets import fetch_lfw_pairs
+except ModuleNotFoundError as e:
+    raise ModuleNotFoundError(
+        "scikit-learn is required. Install with `pip install scikit-learn` "
+        "and ensure your GitHub Actions workflow installs requirements.txt."
+    ) from e
 
 # --------------------
-# Argsss
+# Args
 # --------------------
 parser = argparse.ArgumentParser()
 parser.add_argument("--IdExecution", type=str, default="console")
@@ -27,7 +35,7 @@ if args.IdExecution:
 print("Using dataset: LFW pairs (scikit-learn)")
 
 # --------------------
-# Helperss
+# Helpers
 # --------------------
 def _split_train_val(x: torch.Tensor, y: torch.Tensor,
                      train_size: float = 0.8, seed: int = 42):
@@ -43,6 +51,29 @@ def _to_tensor(arr) -> torch.Tensor:
         return arr
     return torch.from_numpy(np.asarray(arr))
 
+def _get_pair_array(bunch):
+    """
+    Robustly extract the image pair array from sklearn's Bunch.
+    Current sklearn exposes 'pairs'. Older/variant keys may be 'images' or 'data'.
+    """
+    if hasattr(bunch, "pairs"):
+        return bunch.pairs
+    if hasattr(bunch, "images"):
+        return bunch.images
+    if isinstance(bunch, dict):
+        if "pairs" in bunch:
+            return bunch["pairs"]
+        if "images" in bunch:
+            return bunch["images"]
+        if "data" in bunch:
+            return bunch["data"]
+    # dict-like access fallback
+    try:
+        return bunch["pairs"]
+    except Exception:
+        pass
+    raise KeyError("Could not find image array in LFW pairs bunch (expected key 'pairs').")
+
 # --------------------
 # Load LFW pairs
 # --------------------
@@ -55,7 +86,7 @@ def load_lfw_pairs(train_size=0.8, color=False, resize=1.0, data_home="./data"):
     """
     kwargs = dict(
         data_home=data_home,
-        color=color,
+        color=bool(color),
         funneled=True,
         resize=resize,
         download_if_missing=True,
@@ -64,9 +95,9 @@ def load_lfw_pairs(train_size=0.8, color=False, resize=1.0, data_home="./data"):
     train_b = fetch_lfw_pairs(subset="train", **kwargs)
     test_b  = fetch_lfw_pairs(subset="test",  **kwargs)
 
-    # sklearn versions: use .pairs if present, else .images
-    x_train_np = getattr(train_b, "pairs", getattr(train_b, "images"))
-    x_test_np  = getattr(test_b,  "pairs", getattr(test_b,  "images"))
+    # Safe access to the image arrays
+    x_train_np = _get_pair_array(train_b)
+    x_test_np  = _get_pair_array(test_b)
     y_train_np = train_b.target
     y_test_np  = test_b.target
 
@@ -75,6 +106,10 @@ def load_lfw_pairs(train_size=0.8, color=False, resize=1.0, data_home="./data"):
     x_test  = _to_tensor(x_test_np)
     y_train = _to_tensor(y_train_np).to(torch.long).view(-1)
     y_test  = _to_tensor(y_test_np).to(torch.long).view(-1)
+
+    # Basic sanity
+    if x_train.ndim not in (4, 5) or x_train.shape[1] != 2:
+        raise ValueError(f"Unexpected LFW pairs shape: {tuple(x_train.shape)}")
 
     # val split from official train
     x_tr, y_tr, x_val, y_val = _split_train_val(x_train, y_train, train_size=train_size)
@@ -88,7 +123,7 @@ def load_lfw_pairs(train_size=0.8, color=False, resize=1.0, data_home="./data"):
 # W&B Logging
 # --------------------
 def load_and_log():
-    color_flag = (args.color.lower() == "true")
+    color_flag = (str(args.color).lower() == "true")
     with wandb.init(
         project="MLOps-Pycon2023",
         name=f"LFW-PAIRS Raw Split | ExecId-{args.IdExecution}",
