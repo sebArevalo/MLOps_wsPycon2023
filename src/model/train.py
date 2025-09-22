@@ -12,7 +12,7 @@ from torchvision.transforms import Compose, Resize, ToTensor, Normalize
 import wandb
 from facenet_pytorch import InceptionResnetV1
 
-from src.model.src import get_model  # <- registry factory
+from src.model import get_model  # <- registry factory
 
 
 # ----------------------------
