@@ -5,7 +5,7 @@ import torch
 import wandb
 
 from src.model import get_model # <- registry factory
-##test
+##testtrr
 parser = argparse.ArgumentParser()
 parser.add_argument('--IdExecution', type=str, default="testing console")
 parser.add_argument('--model', type=str, default='pairhead_mlp_bn',
