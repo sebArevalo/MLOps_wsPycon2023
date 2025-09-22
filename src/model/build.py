@@ -4,7 +4,7 @@ import argparse
 import torch
 import wandb
 
-from src import get_model  # <- registry factory
+from src.model.src import get_model # <- registry factory
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--IdExecution', type=str, default="testing console")

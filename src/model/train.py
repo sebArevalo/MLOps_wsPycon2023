@@ -12,7 +12,7 @@ from torchvision.transforms import Compose, Resize, ToTensor, Normalize
 import wandb
 from facenet_pytorch import InceptionResnetV1
 
-from src import get_model  # <- registry factory
+from src.model.src import get_model  # <- registry factory
 
 
 # ----------------------------
@@ -310,3 +310,4 @@ if __name__ == "__main__":
 
     best_ckpt, model_cfg = train_and_log(train_cfg, experiment_id='A')
     evaluate_and_log(model_cfg, experiment_id='A')
+###
