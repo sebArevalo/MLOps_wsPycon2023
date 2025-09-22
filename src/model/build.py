@@ -55,4 +55,4 @@ build_model_and_log(
     model_name=args.model,
     model_description=f"{args.model} initialized for LFW pair verification"
 )
-###hola
+###hol
