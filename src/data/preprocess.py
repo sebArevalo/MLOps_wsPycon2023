@@ -49,33 +49,36 @@ def build_embedder() -> InceptionResnetV1:
         p.requires_grad = False
     return m
 
-def _ensure_hwc3_uint8(t: torch.Tensor) -> torch.Tensor:
+def _hwc_any_to_chw_float_m1_1(imgs_hwc: torch.Tensor) -> torch.Tensor:
     """
-    Accepts (H,W), (H,W,1) or (H,W,3) torch.uint8 and returns (H,W,3) torch.uint8.
+    imgs_hwc: (B, H, W, C[=1 or 3]) tensor of dtype uint8/float32/float64 on CPU
+    returns: (B, 3, 160, 160) float32 on device, normalized to [-1, 1]
     """
-    assert t.dtype == torch.uint8, f"Expected uint8, got {t.dtype}"
-    if t.ndim == 2:
-        t = t.unsqueeze(-1).repeat(1, 1, 3)
-    elif t.shape[-1] == 1:
-        t = t.repeat(1, 1, 3)
-    return t
-
-def _prep_batch_for_facenet(imgs_hwc: torch.Tensor) -> torch.Tensor:
-    """
-    imgs_hwc: (B, H, W, C[=1 or 3]) uint8 tensor on CPU
-    returns: (B, 3, 160, 160) float32 tensor on `device`, normalized to [-1, 1]
-    """
-    # Ensure 3 channels
+    # If single channel, repeat to 3
     if imgs_hwc.shape[-1] == 1:
-        imgs_hwc = imgs_hwc.repeat(1, 1, 1, 3)  # (B, H, W, 3)
+        imgs_hwc = imgs_hwc.repeat(1, 1, 1, 3)
 
-    # HWC uint8 -> CHW float in [0,1]
-    x = imgs_hwc.permute(0, 3, 1, 2).to(torch.float32) / 255.0  # (B,3,H,W)
+    x = imgs_hwc
 
-    # Resize to 160x160 with bilinear interpolation
+    # Convert to float32 (handle both uint8 and float inputs)
+    if x.dtype == torch.uint8:
+        x = x.to(torch.float32) / 255.0
+    else:
+        x = x.to(torch.float32)
+        # Auto-scale if likely 0..255
+        with torch.no_grad():
+            maxv = float(x.max().item()) if x.numel() > 0 else 1.0
+        if maxv > 1.5:
+            x = x / 255.0
+        x.clamp_(0.0, 1.0)
+
+    # HWC -> CHW
+    x = x.permute(0, 3, 1, 2)  # (B,3,H,W)
+
+    # Resize to FaceNet input
     x = F.interpolate(x, size=(160, 160), mode="bilinear", align_corners=False)
 
-    # Normalize to [-1, 1] with mean=0.5, std=0.5
+    # Normalize to [-1, 1] (mean=0.5, std=0.5)
     x = (x - 0.5) / 0.5
 
     return x.to(device)
@@ -83,12 +86,12 @@ def _prep_batch_for_facenet(imgs_hwc: torch.Tensor) -> torch.Tensor:
 @torch.no_grad()
 def embed_pairs(embedder: InceptionResnetV1, pairs: torch.Tensor, batch_size: int = 128) -> torch.Tensor:
     """
-    pairs: (N, 2, H, W[, C]) uint8
+    pairs: (N, 2, H, W[, C]) in uint8 or float
     returns: (N, 2, 512) float32 (L2-normalized) on CPU
     """
     # Ensure shape (N, 2, H, W, C)
-    if pairs.ndim == 4:  # (N, 2, H, W)
-        pairs = pairs.unsqueeze(-1)
+    if pairs.ndim == 4:  # (N,2,H,W)
+        pairs = pairs.unsqueeze(-1)  # -> (N,2,H,W,1)
 
     N = pairs.shape[0]
     E1_list, E2_list = [], []
@@ -97,17 +100,18 @@ def embed_pairs(embedder: InceptionResnetV1, pairs: torch.Tensor, batch_size: in
         chunk = pairs[i:i + batch_size]  # (B, 2, H, W, C)
         B = chunk.shape[0]
 
-        # Face 1
-        imgs1 = chunk[:, 0]  # (B,H,W,C)
-        imgs1 = torch.stack([_ensure_hwc3_uint8(img.cpu()) for img in imgs1], dim=0)
-        t1 = _prep_batch_for_facenet(imgs1)  # (B,3,160,160)
-        e1 = embedder(t1)                     # (B,512)
+        # Face 1 batch (CPU -> device)
+        imgs1 = chunk[:, 0]                              # (B,H,W,C)
+        imgs1 = imgs1.contiguous().cpu()                 # keep CPU for preprocessing
+        t1 = _hwc_any_to_chw_float_m1_1(imgs1)           # (B,3,160,160)
 
-        # Face 2
+        # Face 2 batch
         imgs2 = chunk[:, 1]
-        imgs2 = torch.stack([_ensure_hwc3_uint8(img.cpu()) for img in imgs2], dim=0)
-        t2 = _prep_batch_for_facenet(imgs2)
-        e2 = embedder(t2)
+        imgs2 = imgs2.contiguous().cpu()
+        t2 = _hwc_any_to_chw_float_m1_1(imgs2)
+
+        e1 = embedder(t1)                                # (B,512)
+        e2 = embedder(t2)                                # (B,512)
 
         e1 = F.normalize(e1, p=2, dim=1).cpu()
         e2 = F.normalize(e2, p=2, dim=1).cpu()
@@ -157,7 +161,7 @@ def preprocess_and_log():
         embedder = build_embedder()
 
         for split in ["training", "validation", "test"]:
-            ds = read_split(raw_dir, split)  # (pairs uint8, y long)
+            ds = read_split(raw_dir, split)  # (pairs, y)
             x_raw, y = ds.tensors
             E = embed_pairs(embedder, x_raw, batch_size=args.batch_size)  # (N,2,512)
             feats = make_pair_features(E)                                 # (N,1026)

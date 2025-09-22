@@ -16,7 +16,7 @@ except ModuleNotFoundError as e:
     ) from e
 
 # --------------------
-# Args
+# Argss
 # --------------------
 parser = argparse.ArgumentParser()
 parser.add_argument("--IdExecution", type=str, default="console")
