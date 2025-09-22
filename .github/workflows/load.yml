@@ -1,25 +1,38 @@
-name: Load raw dataset to W&B
+name: Run load.py (LFW pairs)
 
 on:
   push:
     branches: [ main ]
     paths:
-      - 'src/data/load.py'
       - 'requirements.txt'
+      - 'src/data/load.py'
 
 jobs:
   load_raw:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-          cache: pip
+          cache: 'pip'
+
       - name: Install dependencies
         run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          python -m pip install --upgrade pip setuptools wheel
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          fi
+          # Fallback in case requirements step is skipped/misread
+          python -c "import sklearn" || pip install scikit-learn
+
+      - name: Sanity check sklearn
+        run: |
+          python -c "import sys, sklearn; print('Python:', sys.version); print('sklearn:', sklearn.__version__); import sklearn.datasets as d; print('fetch_lfw_pairs exists:', hasattr(d, 'fetch_lfw_pairs'))"
+
       - name: Run load.py (W&B off)
         env:
           WANDB_MODE: disabled

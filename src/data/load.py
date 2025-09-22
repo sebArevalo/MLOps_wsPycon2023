@@ -27,7 +27,7 @@ if args.IdExecution:
 print("Using dataset: LFW pairs (scikit-learn)")
 
 # --------------------
-# Helpers
+# Helperss
 # --------------------
 def _split_train_val(x: torch.Tensor, y: torch.Tensor,
                      train_size: float = 0.8, seed: int = 42):
