@@ -1,313 +1,268 @@
-# train.py
+# src/model/train.py
 import os
 import argparse
-from typing import Tuple
+from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
-from torch import nn
 from torch.utils.data import TensorDataset, DataLoader
-from torchvision.transforms import Compose, Resize, ToTensor, Normalize
-
-import wandb
 from facenet_pytorch import InceptionResnetV1
+import wandb
 
-from src.model import get_model  # <- registry factory
+# import the registry (works when run as a module: python -m src.model.train)
+from . import get_model
 
-
-# ----------------------------
-# CLIIIII
-# ----------------------------
+# --------------------------
+# CLI
+# --------------------------
 parser = argparse.ArgumentParser()
-parser.add_argument('--IdExecution', type=str, default="testing console")
-parser.add_argument('--model', type=str, default='pairhead_mlp_bn',
-                    help='Model registered in src: linear, pairhead_mlp_bn, pairhead_mlp_res')
-parser.add_argument('--init_model_artifact', type=str, default=None,
-                    help='Initialized model artifact to start from, e.g. "pairhead_mlp_bn:latest". '
-                         'Defaults to <model>:latest if omitted.')
-parser.add_argument('--dataset_artifact', type=str, default='lfw-pairs-raw:latest',
-                    help='W&B dataset artifact with training.pt/validation.pt/test.pt')
-parser.add_argument('--batch_size', type=int, default=128)
-parser.add_argument('--epochs', type=int, default=25)
-parser.add_argument('--optimizer', type=str, default='Adam')
-parser.add_argument('--lr', type=float, default=1e-3)
-parser.add_argument('--batch_log_interval', type=int, default=25)
+parser.add_argument("--IdExecution", type=str, default="console")
+parser.add_argument("--artifact_raw", type=str, default="lfw-pairs-raw:latest")
+parser.add_argument("--initialized_model_art", type=str, default=None,
+                    help="W&B artifact name of the initialized model to start from. "
+                         "If None, we build from config below.")
+parser.add_argument("--model_name", type=str, default="pairhead_mlp_bn",
+                    help="Registry model name when not loading an initialized artifact.")
+parser.add_argument("--batch_size", type=int, default=128)
+parser.add_argument("--epochs", type=int, default=5)
+parser.add_argument("--optimizer", type=str, default="Adam")
+parser.add_argument("--lr", type=float, default=1e-3)
+parser.add_argument("--batch_log_interval", type=int, default=25)
 args = parser.parse_args()
 
-if args.init_model_artifact is None:
-    args.init_model_artifact = f"{args.model}:latest"
+print(f"IdExecution: {args.IdExecution}\n")
 
-print(f"IdExecution: {args.IdExecution}")
+# --------------------------
+# Device
+# --------------------------
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 print("Device:", device)
 
-
-# ----------------------------
-# Data reading (raw .pt pairs)
-# ----------------------------
-def read_split(data_dir: str, split: str) -> TensorDataset:
-    """Reads <split>.pt saved as (x, y). For LFW pairs: x shape ~ (N, 2, H, W[, C]), y in {0,1}."""
-    x, y = torch.load(os.path.join(data_dir, f"{split}.pt"))
+# --------------------------
+# Data helpers
+# --------------------------
+def read_split(dirpath: str, split: str) -> TensorDataset:
+    x, y = torch.load(os.path.join(dirpath, f"{split}.pt"))
     return TensorDataset(x, y)
 
-
-# ----------------------------
-# Embeddings + pair features
-# ----------------------------
-def build_embedder() -> Tuple[InceptionResnetV1, Compose]:
-    """Frozen FaceNet embedder + transforms to 3x160x160 tensor in [-1,1]."""
-    embedder = InceptionResnetV1(pretrained='vggface2').eval().to(device)
-    for p in embedder.parameters():
+# --------------------------
+# FaceNet embedder + pure-Torch preprocessing
+# --------------------------
+def build_embedder() -> InceptionResnetV1:
+    m = InceptionResnetV1(pretrained="vggface2").eval().to(device)
+    for p in m.parameters():
         p.requires_grad = False
-    tx = Compose([
-        Resize((160, 160)),
-        ToTensor(),                         # HWC uint8 -> CHW float in [0,1]
-        Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5])  # -> [-1, 1]
-    ])
-    return embedder, tx
+    return m
 
+def _hwc_any_to_chw_float_m1_1(imgs_hwc: torch.Tensor) -> torch.Tensor:
+    """
+    imgs_hwc: (B,H,W,C[=1 or 3]) uint8/float on CPU
+    returns: (B,3,160,160) float32 on device, normalized to [-1,1]
+    """
+    if imgs_hwc.shape[-1] == 1:
+        imgs_hwc = imgs_hwc.repeat(1, 1, 1, 3)
 
-def _to_rgb(img: torch.Tensor) -> torch.Tensor:
-    """img: (H, W) or (H, W, 1) or (H, W, 3) uint8 -> (H, W, 3) uint8."""
-    if img.ndim == 2:
-        img = img.unsqueeze(-1).repeat(1, 1, 3)
-    elif img.shape[-1] == 1:
-        img = img.repeat(1, 1, 3)
-    return img
+    x = imgs_hwc
+    if x.dtype == torch.uint8:
+        x = x.float() / 255.0
+    else:
+        x = x.float()
+        with torch.no_grad():
+            mx = float(x.max().item()) if x.numel() else 1.0
+        if mx > 1.5:
+            x = x / 255.0
+        x.clamp_(0.0, 1.0)
 
+    x = x.permute(0, 3, 1, 2)                              # HWC->CHW
+    x = F.interpolate(x, (160, 160), mode="bilinear", align_corners=False)
+    x = (x - 0.5) / 0.5                                    # [-1,1]
+    return x.to(device)
 
 @torch.no_grad()
-def embed_batch(embedder, tx, pair_imgs: torch.Tensor) -> torch.Tensor:
+def embed_batch(embedder: InceptionResnetV1, xpair: torch.Tensor) -> torch.Tensor:
     """
-    pair_imgs: (B, 2, H, W[, C]) uint8
-    returns embeddings: (B, 2, 512) float32, L2-normalized
+    xpair: (B,2,H,W[,C]) in uint8 or float
+    returns: (B,2,512) embeddings (L2-normed) on CPU
     """
-    # ensure HWC last
-    if pair_imgs.ndim == 5:  # (B, 2, H, W, C)
-        pass
-    elif pair_imgs.ndim == 4:  # (B, 2, H, W) -> add C=1
-        pair_imgs = pair_imgs.unsqueeze(-1)
-    else:
-        raise ValueError("Unexpected pair_imgs shape")
+    if xpair.ndim == 4:                 # (B,2,H,W)
+        xpair = xpair.unsqueeze(-1)     # -> (B,2,H,W,1)
 
-    B = pair_imgs.shape[0]
-    e_list = []
-    for i in range(2):  # two faces per pair
-        imgs = pair_imgs[:, i]  # (B, H, W, C/1)
-        # convert to RGB HWC uint8 per image -> CHW float via tx
-        # build a batch
-        batch_tensors = []
-        for b in range(B):
-            rgb = _to_rgb(imgs[b].cpu())
-            t = tx(rgb)  # 3x160x160
-            batch_tensors.append(t)
-        batch = torch.stack(batch_tensors, dim=0).to(device)
-        e = embedder(batch)            # (B, 512)
-        e = F.normalize(e, p=2, dim=1) # L2 norm
-        e_list.append(e)
-    E1, E2 = e_list[0], e_list[1]      # (B,512) each
-    return torch.stack([E1, E2], dim=1)  # (B, 2, 512)
+    imgs1 = xpair[:, 0].contiguous().cpu()   # (B,H,W,C)
+    imgs2 = xpair[:, 1].contiguous().cpu()
 
+    t1 = _hwc_any_to_chw_float_m1_1(imgs1)
+    t2 = _hwc_any_to_chw_float_m1_1(imgs2)
+
+    e1 = embedder(t1)                          # (B,512)
+    e2 = embedder(t2)
+    e1 = F.normalize(e1, p=2, dim=1).cpu()
+    e2 = F.normalize(e2, p=2, dim=1).cpu()
+    return torch.stack([e1, e2], dim=1)        # (B,2,512)
 
 def make_pair_features(E: torch.Tensor) -> torch.Tensor:
     """
-    E: (B, 2, D) -> features (B, 1026) for D=512
-    x = [|e1-e2|, e1*e2, cos, 1-cos]
+    E: (B,2,512) -> (B,1026) features: [|e1-e2|, e1*e2, cos, 1-cos]
     """
     e1, e2 = E[:, 0, :], E[:, 1, :]
     absdiff = (e1 - e2).abs()
     hadamard = e1 * e2
     cos = F.cosine_similarity(e1, e2).unsqueeze(-1)
     one_minus = 1.0 - cos
-    return torch.cat([absdiff, hadamard, cos, one_minus], dim=-1)  # (B, 1026)
+    return torch.cat([absdiff, hadamard, cos, one_minus], dim=-1).float()
 
+# --------------------------
+# Training / Eval
+# --------------------------
+@dataclass
+class TrainCfg:
+    batch_size: int
+    epochs: int
+    batch_log_interval: int
+    optimizer: str
+    lr: float
 
-# ----------------------------
-# Train / Eval
-# ----------------------------
-def train_one_epoch(model, loader, optimizer, example_ct, epoch, log_interval):
+def train_one_epoch(model, loader, optimizer, example_ct, epoch, log_interval, embedder):
     model.train()
-    criterion = nn.BCEWithLogitsLoss()
-    for bidx, (xpair, y) in enumerate(loader):
-        y = y.float().to(device)  # (B,)
-        # compute pair features on the fly
-        E = embed_batch(embedder, tx, xpair)       # (B, 2, 512)
-        feats = make_pair_features(E)              # (B, 1026)
+    for batch_idx, (xpair, y) in enumerate(loader):
+        with torch.no_grad():
+            E = embed_batch(embedder, xpair)        # (B,2,512)
+            feats = make_pair_features(E)           # (B,1026)
+        feats, y = feats.to(device), y.to(device)
+
         optimizer.zero_grad()
-        logits = model(feats)                      # (B, 1)
-        logits = logits.squeeze(1)
-        loss = criterion(logits, y)
+        logits = model(feats).squeeze(-1)
+        loss = F.binary_cross_entropy_with_logits(logits.float(), y.float())
         loss.backward()
         optimizer.step()
 
-        example_ct += xpair.size(0)
-
-        if bidx % log_interval == 0:
+        example_ct += len(y)
+        if batch_idx % log_interval == 0:
+            print(f"Train Epoch: {epoch} [{batch_idx*len(y)}/{len(loader.dataset)} "
+                  f"({batch_idx/len(loader):.0%})]\tLoss: {loss.item():.6f}")
             wandb.log({"epoch": epoch, "train/loss": float(loss)}, step=example_ct)
-            print(f"Train Epoch {epoch} [{bidx * len(y)}/{len(loader.dataset)}] "
-                  f"({bidx/len(loader):.0%})  Loss: {loss.item():.6f}")
     return example_ct
 
-
 @torch.no_grad()
-def evaluate(model, loader, split_name="validation", example_ct=0, epoch=0):
+def evaluate_epoch(model, loader, embedder):
     model.eval()
-    criterion = nn.BCEWithLogitsLoss(reduction='sum')
-
+    total, correct = 0, 0
     total_loss = 0.0
-    y_true_all, y_score_all = [], []
-
     for xpair, y in loader:
-        y = y.float().to(device)
-        E = embed_batch(embedder, tx, xpair)
-        feats = make_pair_features(E)
-        logits = model(feats).squeeze(1)
-        loss = criterion(logits, y)
-        total_loss += loss.item()
+        E = embed_batch(embedder, xpair)
+        feats = make_pair_features(E).to(device)
+        y = y.to(device)
 
-        y_true_all.append(y.detach().cpu())
-        y_score_all.append(torch.sigmoid(logits).detach().cpu())
+        logits = model(feats).squeeze(-1)
+        loss = F.binary_cross_entropy_with_logits(logits.float(), y.float(), reduction="sum")
+        total_loss += float(loss.item())
 
-    y_true = torch.cat(y_true_all).numpy()
-    y_score = torch.cat(y_score_all).numpy()
-    avg_loss = total_loss / len(loader.dataset)
+        preds = (torch.sigmoid(logits) >= 0.5).long()
+        correct += int((preds == y).sum())
+        total += y.numel()
 
-    # Metrics
-    try:
-        from sklearn.metrics import roc_auc_score, average_precision_score, roc_curve
-        roc_auc = float(roc_auc_score(y_true, y_score))
-        pr_auc = float(average_precision_score(y_true, y_score))
+    avg_loss = total_loss / total
+    acc = correct / total if total else 0.0
+    return avg_loss, acc
 
-        # Best threshold by accuracy
-        fpr, tpr, thr = roc_curve(y_true, y_score)
-        accs = []
-        for th in thr:
-            preds = (y_score >= th).astype('int64')
-            acc = (preds == y_true).mean()
-            accs.append(acc)
-        best_acc = float(max(accs)) if accs else 0.0
-    except Exception as e:
-        print("Metric computation issue:", e)
-        roc_auc, pr_auc, best_acc = 0.0, 0.0, 0.0
-
-    wandb.log({
-        "epoch": epoch,
-        f"{split_name}/loss": avg_loss,
-        f"{split_name}/roc_auc": roc_auc,
-        f"{split_name}/pr_auc": pr_auc,
-        f"{split_name}/best_acc": best_acc,
-    }, step=example_ct)
-
-    print(f"[{split_name}] loss={avg_loss:.4f} roc_auc={roc_auc:.4f} "
-          f"pr_auc={pr_auc:.4f} best_acc={best_acc:.4f}")
-
-    return avg_loss, roc_auc, pr_auc, best_acc
-
-
-def train_and_log(config, experiment_id='00'):
+# --------------------------
+# Orchestration
+# --------------------------
+def train_and_log(cfg: TrainCfg, experiment_id: str = "A"):
     with wandb.init(
         project="MLOps-Pycon2023",
-        name=f"Train {args.model} ExecId-{args.IdExecution} Exp-{experiment_id}",
+        name=f"Train {args.model_name} ExecId-{args.IdExecution} Exp-{experiment_id}",
         job_type="train-model",
-        config=config
+        config=vars(cfg),
     ) as run:
-        cfg = wandb.config
+        # 1) raw pairs artifact
+        raw_art = run.use_artifact(args.artifact_raw)
+        raw_dir = raw_art.download()
 
-        # ---- Data
-        data_art = run.use_artifact(args.dataset_artifact)
-        data_dir = data_art.download()
-        train_ds = read_split(data_dir, "training")
-        val_ds   = read_split(data_dir, "validation")
+        train_set = read_split(raw_dir, "training")
+        valid_set = read_split(raw_dir, "validation")
 
-        train_loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True, num_workers=2, pin_memory=True)
-        val_loader   = DataLoader(val_ds,   batch_size=cfg.batch_size, shuffle=False, num_workers=2, pin_memory=True)
+        train_loader = DataLoader(train_set, batch_size=cfg.batch_size, shuffle=True)
+        valid_loader = DataLoader(valid_set, batch_size=cfg.batch_size, shuffle=False)
 
-        # ---- Model (initialized weights)
-        init_art = run.use_artifact(args.init_model_artifact)
-        init_dir = init_art.download()
-        # file is "initialized_model_<model>.pth"
-        init_fname = [f for f in os.listdir(init_dir) if f.startswith("initialized_model_") and f.endswith(".pth")][0]
-        init_path = os.path.join(init_dir, init_fname)
-        model_config = init_art.metadata or {}
-        # ensure defaults if missing
-        model_config.setdefault("input_shape", 1026)
-        model_config.setdefault("num_classes", 1)
+        # 2) model: from initialized artifact or build fresh from registry
+        if args.initialized_model_art:
+            m_art = run.use_artifact(args.initialized_model_art)
+            m_dir = m_art.download()
+            m_path = os.path.join(m_dir, next(p for p in os.listdir(m_dir) if p.endswith(".pth")))
+            m_cfg = m_art.metadata or {}
+            model = get_model(m_cfg.get("model_name", args.model_name), **m_cfg).to(device)
+            model.load_state_dict(torch.load(m_path, map_location=device))
+        else:
+            # default config if no artifact provided
+            m_cfg = {"input_shape": 1026, "hidden_layer_1": 256, "hidden_layer_2": 128, "num_classes": 1}
+            model = get_model(args.model_name, **m_cfg).to(device)
 
-        model = get_model(args.model, **model_config).to(device)
-        model.load_state_dict(torch.load(init_path, map_location=device))
-        wandb.watch(model, log="all", log_freq=100)
+        # 3) optimizer + embedder
+        optimizer = getattr(torch.optim, cfg.optimizer)(model.parameters(), lr=cfg.lr)
+        embedder = build_embedder()
 
-        # ---- Optimizer
-        optimizer_cls = getattr(torch.optim, cfg.optimizer)
-        optimizer = optimizer_cls(model.parameters(), lr=cfg.lr)
-
-        # ---- Train
+        # 4) train
         example_ct = 0
-        best_val = -1.0
-        best_ckpt = "trained_model_best.pth"
-
+        best_val = float("inf")
+        best_path = "trained_model.pth"
         for epoch in range(cfg.epochs):
-            example_ct = train_one_epoch(model, train_loader, optimizer, example_ct, epoch, cfg.batch_log_interval)
-            _, roc_auc, pr_auc, best_acc = evaluate(model, val_loader, "validation", example_ct, epoch)
-            score = roc_auc  # pick your selection metric
-            if score > best_val:
-                best_val = score
-                torch.save(model.state_dict(), best_ckpt)
+            example_ct = train_one_epoch(model, train_loader, optimizer, example_ct, epoch,
+                                         cfg.batch_log_interval, embedder)
+            val_loss, val_acc = evaluate_epoch(model, valid_loader, embedder)
+            print(f"[val] epoch {epoch} loss={val_loss:.4f} acc={val_acc:.4f}")
+            wandb.log({"epoch": epoch, "validation/loss": val_loss, "validation/accuracy": val_acc},
+                      step=example_ct)
+            if val_loss < best_val:
+                best_val = val_loss
+                torch.save(model.state_dict(), best_path)
 
-        # ---- Log trained artifact
-        trained_art = wandb.Artifact(
+        # 5) log trained artifact
+        art = wandb.Artifact(
             "trained-model", type="model",
-            description=f"Trained {args.model} on LFW pairs",
-            metadata=dict(model_config)
+            description="Pair head trained on LFW embeddings",
+            metadata={"model_name": args.model_name, **(m_cfg or {})},
         )
-        trained_art.add_file(best_ckpt)
-        run.log_artifact(trained_art)
+        art.add_file(best_path)
+        wandb.save(best_path)
+        run.log_artifact(art)
 
-        return best_ckpt, model_config
+        return best_path, m_cfg
 
-
-def evaluate_and_log(model_config, experiment_id='00'):
+def evaluate_and_log(trained_artifact: str, experiment_id: str = "A"):
     with wandb.init(
         project="MLOps-Pycon2023",
-        name=f"Eval {args.model} ExecId-{args.IdExecution} Exp-{experiment_id}",
+        name=f"Eval {args.model_name} ExecId-{args.IdExecution} Exp-{experiment_id}",
         job_type="eval-model",
-        config=model_config
     ) as run:
-        # Data
-        data_art = run.use_artifact(args.dataset_artifact)
-        data_dir = data_art.download()
-        test_ds = read_split(data_dir, "test")
-        test_loader = DataLoader(test_ds, batch_size=128, shuffle=False, num_workers=2, pin_memory=True)
+        raw_art = run.use_artifact(args.artifact_raw)
+        raw_dir = raw_art.download()
+        test_set = read_split(raw_dir, "test")
+        test_loader = DataLoader(test_set, batch_size=128, shuffle=False)
 
-        # Trained model
-        trained_art = run.use_artifact("trained-model:latest")
-        mdir = trained_art.download()
-        mpath = os.path.join(mdir, "trained_model_best.pth")
-        model = get_model(args.model, **(model_config or {"input_shape": 1026, "num_classes": 1})).to(device)
-        model.load_state_dict(torch.load(mpath, map_location=device))
+        m_art = run.use_artifact(trained_artifact)
+        m_dir = m_art.download()
+        m_path = os.path.join(m_dir, next(p for p in os.listdir(m_dir) if p.endswith(".pth")))
+        m_cfg = m_art.metadata or {}
 
-        # Final eval
-        evaluate(model, test_loader, "test", example_ct=0, epoch=0)
+        model = get_model(m_cfg.get("model_name", args.model_name), **m_cfg).to(device)
+        model.load_state_dict(torch.load(m_path, map_location=device))
 
+        embedder = build_embedder()
+        loss, acc = evaluate_epoch(model, test_loader, embedder)
+        run.summary.update({"loss": loss, "accuracy": acc})
 
-# ----------------------------
-# Main
-# ----------------------------
+# --------------------------
+# Entrypoint
+# --------------------------
 if __name__ == "__main__":
-    # global (frozen) embedder + transforms
-    embedder, tx = build_embedder()
+    cfg = TrainCfg(
+        batch_size=args.batch_size,
+        epochs=args.epochs,
+        batch_log_interval=args.batch_log_interval,
+        optimizer=args.optimizer,
+        lr=args.lr,
+    )
 
-    train_cfg = {
-        "batch_size": args.batch_size,
-        "epochs": args.epochs,
-        "batch_log_interval": args.batch_log_interval,
-        "optimizer": args.optimizer,
-        "lr": args.lr,
-        "model": args.model,
-        "dataset_artifact": args.dataset_artifact,
-        "init_model_artifact": args.init_model_artifact,
-    }
-
-    best_ckpt, model_cfg = train_and_log(train_cfg, experiment_id='A')
-    evaluate_and_log(model_cfg, experiment_id='A')
-###
+    best_ckpt, model_cfg = train_and_log(cfg, experiment_id="A")
+    # If you want an eval job here, you can call:
+    # evaluate_and_log("trained-model:latest", experiment_id="A")
