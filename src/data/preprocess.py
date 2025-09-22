@@ -5,8 +5,7 @@ from typing import Tuple
 
 import torch
 import torch.nn.functional as F
-from torch.utils.data import TensorDataset, DataLoader
-from torchvision.transforms import Compose, Resize, ToTensor, Normalize
+from torch.utils.data import TensorDataset
 from facenet_pytorch import InceptionResnetV1
 import wandb
 
@@ -31,8 +30,8 @@ print("Device:", device)
 # ----------------------------------------------------
 # I/O helpers
 # ----------------------------------------------------
-def read_split(data_dir: str, split: str) -> TensorDataset:
-    x, y = torch.load(os.path.join(data_dir, f"{split}.pt"))
+def read_split(dirpath: str, split: str) -> TensorDataset:
+    x, y = torch.load(os.path.join(dirpath, f"{split}.pt"))
     return TensorDataset(x, y)
 
 def save_split(artifact: wandb.Artifact, name: str, dataset: TensorDataset):
@@ -43,59 +42,81 @@ def save_split(artifact: wandb.Artifact, name: str, dataset: TensorDataset):
 # ----------------------------------------------------
 # Embedding & feature utils
 # ----------------------------------------------------
-def build_embedder() -> Tuple[InceptionResnetV1, Compose]:
-    """Frozen FaceNet and a transform to 3x160x160 in [-1,1]."""
-    embedder = InceptionResnetV1(pretrained="vggface2").eval().to(device)
-    for p in embedder.parameters():
+def build_embedder() -> InceptionResnetV1:
+    """Frozen FaceNet embedder."""
+    m = InceptionResnetV1(pretrained="vggface2").eval().to(device)
+    for p in m.parameters():
         p.requires_grad = False
-    tx = Compose([
-        Resize((160, 160)),
-        ToTensor(),
-        Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
-    ])
-    return embedder, tx
+    return m
 
-def _to_rgb(img: torch.Tensor) -> torch.Tensor:
-    """img: (H,W) or (H,W,1) or (H,W,3) uint8 -> (H,W,3) uint8 (CPU tensor)."""
-    if img.ndim == 2:
-        img = img.unsqueeze(-1).repeat(1, 1, 3)
-    elif img.shape[-1] == 1:
-        img = img.repeat(1, 1, 3)
-    return img
+def _ensure_hwc3_uint8(t: torch.Tensor) -> torch.Tensor:
+    """
+    Accepts (H,W), (H,W,1) or (H,W,3) torch.uint8 and returns (H,W,3) torch.uint8.
+    """
+    assert t.dtype == torch.uint8, f"Expected uint8, got {t.dtype}"
+    if t.ndim == 2:
+        t = t.unsqueeze(-1).repeat(1, 1, 3)
+    elif t.shape[-1] == 1:
+        t = t.repeat(1, 1, 3)
+    return t
+
+def _prep_batch_for_facenet(imgs_hwc: torch.Tensor) -> torch.Tensor:
+    """
+    imgs_hwc: (B, H, W, C[=1 or 3]) uint8 tensor on CPU
+    returns: (B, 3, 160, 160) float32 tensor on `device`, normalized to [-1, 1]
+    """
+    # Ensure 3 channels
+    if imgs_hwc.shape[-1] == 1:
+        imgs_hwc = imgs_hwc.repeat(1, 1, 1, 3)  # (B, H, W, 3)
+
+    # HWC uint8 -> CHW float in [0,1]
+    x = imgs_hwc.permute(0, 3, 1, 2).to(torch.float32) / 255.0  # (B,3,H,W)
+
+    # Resize to 160x160 with bilinear interpolation
+    x = F.interpolate(x, size=(160, 160), mode="bilinear", align_corners=False)
+
+    # Normalize to [-1, 1] with mean=0.5, std=0.5
+    x = (x - 0.5) / 0.5
+
+    return x.to(device)
 
 @torch.no_grad()
-def embed_pairs(embedder, tx, pairs: torch.Tensor, batch_size: int = 128) -> torch.Tensor:
+def embed_pairs(embedder: InceptionResnetV1, pairs: torch.Tensor, batch_size: int = 128) -> torch.Tensor:
     """
     pairs: (N, 2, H, W[, C]) uint8
-    returns: embeddings (N, 2, 512) float32 (L2-normalized)
+    returns: (N, 2, 512) float32 (L2-normalized) on CPU
     """
     # Ensure shape (N, 2, H, W, C)
-    if pairs.ndim == 4:
-        pairs = pairs.unsqueeze(-1)  # add C=1
-    N = pairs.shape[0]
+    if pairs.ndim == 4:  # (N, 2, H, W)
+        pairs = pairs.unsqueeze(-1)
 
-    # Process in mini-batches to save memory
+    N = pairs.shape[0]
     E1_list, E2_list = [], []
+
     for i in range(0, N, batch_size):
         chunk = pairs[i:i + batch_size]  # (B, 2, H, W, C)
         B = chunk.shape[0]
-        tens = []
-        for k in range(2):
-            imgs = chunk[:, k]  # (B, H, W, C)
-            batch_imgs = []
-            for b in range(B):
-                rgb = _to_rgb(imgs[b].cpu())
-                batch_imgs.append(tx(rgb))  # (3, 160, 160)
-            tens.append(torch.stack(batch_imgs, dim=0).to(device))
-        e1 = embedder(tens[0])  # (B, 512)
-        e2 = embedder(tens[1])  # (B, 512)
-        e1 = F.normalize(e1, p=2, dim=1)
-        e2 = F.normalize(e2, p=2, dim=1)
-        E1_list.append(e1.cpu())
-        E2_list.append(e2.cpu())
+
+        # Face 1
+        imgs1 = chunk[:, 0]  # (B,H,W,C)
+        imgs1 = torch.stack([_ensure_hwc3_uint8(img.cpu()) for img in imgs1], dim=0)
+        t1 = _prep_batch_for_facenet(imgs1)  # (B,3,160,160)
+        e1 = embedder(t1)                     # (B,512)
+
+        # Face 2
+        imgs2 = chunk[:, 1]
+        imgs2 = torch.stack([_ensure_hwc3_uint8(img.cpu()) for img in imgs2], dim=0)
+        t2 = _prep_batch_for_facenet(imgs2)
+        e2 = embedder(t2)
+
+        e1 = F.normalize(e1, p=2, dim=1).cpu()
+        e2 = F.normalize(e2, p=2, dim=1).cpu()
+        E1_list.append(e1)
+        E2_list.append(e2)
+
     E1 = torch.cat(E1_list, dim=0)
     E2 = torch.cat(E2_list, dim=0)
-    return torch.stack([E1, E2], dim=1)  # (N, 2, 512)
+    return torch.stack([E1, E2], dim=1)  # (N,2,512)
 
 def make_pair_features(E: torch.Tensor) -> torch.Tensor:
     """
@@ -107,8 +128,7 @@ def make_pair_features(E: torch.Tensor) -> torch.Tensor:
     hadamard = e1 * e2
     cos = F.cosine_similarity(e1, e2).unsqueeze(-1)
     one_minus = 1.0 - cos
-    feats = torch.cat([absdiff, hadamard, cos, one_minus], dim=-1).to(torch.float32)
-    return feats  # (N, 1026)
+    return torch.cat([absdiff, hadamard, cos, one_minus], dim=-1).to(torch.float32)
 
 # ----------------------------------------------------
 # Main preprocess & log
@@ -123,7 +143,6 @@ def preprocess_and_log():
         raw_art = run.use_artifact(args.input_artifact)
         raw_dir = raw_art.download(root="./data/artifacts/")
 
-        # Output processed artifact
         processed = wandb.Artifact(
             args.output_artifact, type="dataset",
             description="LFW pairs converted to Facenet embeddings and 1026-D pair features",
@@ -135,14 +154,13 @@ def preprocess_and_log():
             }
         )
 
-        # Embed once, save features for all splits
-        embedder, tx = build_embedder()
+        embedder = build_embedder()
 
         for split in ["training", "validation", "test"]:
-            ds = read_split(raw_dir, split)         # (pairs uint8, y long)
+            ds = read_split(raw_dir, split)  # (pairs uint8, y long)
             x_raw, y = ds.tensors
-            E = embed_pairs(embedder, tx, x_raw, batch_size=args.batch_size)  # (N,2,512)
-            feats = make_pair_features(E)           # (N,1026) float32
+            E = embed_pairs(embedder, x_raw, batch_size=args.batch_size)  # (N,2,512)
+            feats = make_pair_features(E)                                 # (N,1026)
             processed_split = TensorDataset(feats, y)
             save_split(processed, split, processed_split)
             print(f"Processed {split}: {len(y)} samples → features {tuple(feats.shape)}")

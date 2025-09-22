@@ -6,7 +6,7 @@ import torch
 from torch.utils.data import TensorDataset
 import wandb
 
-# Helpful import guard so CI/local errors are clearer
+# Helpful import guard so CI/local errors are clearerre
 try:
     from sklearn.datasets import fetch_lfw_pairs
 except ModuleNotFoundError as e:
